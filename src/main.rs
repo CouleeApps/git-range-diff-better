@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 const RED: &str = "\x1b[31m";
@@ -21,11 +23,13 @@ enum AppError {
     Help(String),
     Usage(String),
     GitDiffFailed {
+        repo: PathBuf,
         range: String,
         status: String,
         stderr: String,
     },
     GitDiffIo {
+        repo: PathBuf,
         range: String,
         source: io::Error,
     },
@@ -38,18 +42,28 @@ impl fmt::Display for AppError {
             AppError::Help(message) => write!(f, "{message}"),
             AppError::Usage(message) => write!(f, "{message}"),
             AppError::GitDiffFailed {
+                repo,
                 range,
                 status,
                 stderr,
             } => {
                 writeln!(
                     f,
-                    "git diff failed for range `{range}` with status {status}"
+                    "git diff failed in `{}` for range `{range}` with status {status}",
+                    repo.display()
                 )?;
                 write!(f, "{}", stderr.trim_end())
             }
-            AppError::GitDiffIo { range, source } => {
-                write!(f, "failed to run git diff for range `{range}`: {source}")
+            AppError::GitDiffIo {
+                repo,
+                range,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to run git diff in `{}` for range `{range}`: {source}",
+                    repo.display()
+                )
             }
             AppError::Output(source) => write!(f, "failed to write output: {source}"),
         }
@@ -76,19 +90,33 @@ fn main() -> ExitCode {
 
 fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), AppError> {
     let options = Options::parse(args)?;
-    let before = git_diff(&options.before_range)?;
-    let after = git_diff(&options.after_range)?;
-    let diff = diff_normalized_lines(&before, &after);
-    let changed_sections = changed_file_sections(&diff);
-
     let stdout = io::stdout();
     let mut handle = stdout.lock();
-    write_compact_colored_diff_refs(&changed_sections, &mut handle).map_err(AppError::Output)
+    render_repository(
+        Path::new("."),
+        Some(&options.before_range),
+        Some(&options.after_range),
+        &mut handle,
+    )
 }
 
 struct Options {
     before_range: String,
     after_range: String,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SubmodulePatchSet {
+    path: String,
+    before_range: Option<String>,
+    after_range: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SubmoduleCommitRange {
+    path: String,
+    old_commit: String,
+    new_commit: String,
 }
 
 impl Options {
@@ -128,21 +156,31 @@ fn usage(program: &str) -> String {
     format!(
         "Usage: {program} <before-push-range> <after-push-range>\n\n\
          Example:\n  {program} abc123..def456 fed789..012345\n\n\
-         Each range is passed directly to `git diff --no-color --no-ext-diff <range>`."
+         Each range is passed directly to \
+         `git diff --no-color --no-ext-diff --submodule=short <range>`."
     )
 }
 
-fn git_diff(range: &str) -> Result<String, AppError> {
+fn git_diff(repo: &Path, range: &str) -> Result<String, AppError> {
     let output = Command::new("git")
-        .args(["diff", "--no-color", "--no-ext-diff", range])
+        .current_dir(repo)
+        .args([
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--submodule=short",
+            range,
+        ])
         .output()
         .map_err(|source| AppError::GitDiffIo {
+            repo: repo.to_path_buf(),
             range: range.to_string(),
             source,
         })?;
 
     if !output.status.success() {
         return Err(AppError::GitDiffFailed {
+            repo: repo.to_path_buf(),
             range: range.to_string(),
             status: output.status.to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -152,6 +190,130 @@ fn git_diff(range: &str) -> Result<String, AppError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+fn render_repository(
+    repo: &Path,
+    before_range: Option<&str>,
+    after_range: Option<&str>,
+    writer: &mut impl Write,
+) -> Result<(), AppError> {
+    let before = optional_git_diff(repo, before_range)?;
+    let after = optional_git_diff(repo, after_range)?;
+    let diff = diff_normalized_lines(&before, &after);
+    let changed_sections = changed_file_sections(&diff);
+
+    write_compact_colored_diff_refs(&changed_sections, writer).map_err(AppError::Output)?;
+
+    for submodule in submodule_patch_sets(&before, &after) {
+        writeln!(writer, "\nSubmodule {}", submodule.path).map_err(AppError::Output)?;
+
+        let submodule_repo = repo.join(&submodule.path);
+        render_repository(
+            &submodule_repo,
+            submodule.before_range.as_deref(),
+            submodule.after_range.as_deref(),
+            writer,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn optional_git_diff(repo: &Path, range: Option<&str>) -> Result<String, AppError> {
+    range.map_or_else(|| Ok(String::new()), |range| git_diff(repo, range))
+}
+
+fn submodule_patch_sets(before: &str, after: &str) -> Vec<SubmodulePatchSet> {
+    let mut patch_sets = BTreeMap::<String, SubmodulePatchSet>::new();
+
+    for range in submodule_commit_ranges(before) {
+        let patch_set = patch_sets
+            .entry(range.path.clone())
+            .or_insert_with(|| SubmodulePatchSet {
+                path: range.path.clone(),
+                ..SubmodulePatchSet::default()
+            });
+        patch_set.before_range = Some(format!("{}..{}", range.old_commit, range.new_commit));
+    }
+
+    for range in submodule_commit_ranges(after) {
+        let patch_set = patch_sets
+            .entry(range.path.clone())
+            .or_insert_with(|| SubmodulePatchSet {
+                path: range.path.clone(),
+                ..SubmodulePatchSet::default()
+            });
+        patch_set.after_range = Some(format!("{}..{}", range.old_commit, range.new_commit));
+    }
+
+    patch_sets.into_values().collect()
+}
+
+fn submodule_commit_ranges(diff: &str) -> Vec<SubmoduleCommitRange> {
+    let mut ranges = Vec::new();
+    let mut section = SubmoduleSection::default();
+
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            push_submodule_section(&mut ranges, &section);
+            section = SubmoduleSection {
+                path: parse_diff_git_path(line),
+                ..SubmoduleSection::default()
+            };
+            continue;
+        }
+
+        if line == "new file mode 160000"
+            || line == "deleted file mode 160000"
+            || line.ends_with(" 160000")
+        {
+            section.is_submodule = true;
+        }
+
+        if let Some(commit) = line.strip_prefix("-Subproject commit ") {
+            section.old_commit = commit.split_whitespace().next().map(str::to_string);
+        } else if let Some(commit) = line.strip_prefix("+Subproject commit ") {
+            section.new_commit = commit.split_whitespace().next().map(str::to_string);
+        }
+    }
+
+    push_submodule_section(&mut ranges, &section);
+    ranges
+}
+
+#[derive(Default)]
+struct SubmoduleSection {
+    path: Option<String>,
+    is_submodule: bool,
+    old_commit: Option<String>,
+    new_commit: Option<String>,
+}
+
+fn push_submodule_section(output: &mut Vec<SubmoduleCommitRange>, section: &SubmoduleSection) {
+    if !section.is_submodule {
+        return;
+    }
+
+    let (Some(path), Some(old_commit), Some(new_commit)) = (
+        section.path.as_ref(),
+        section.old_commit.as_ref(),
+        section.new_commit.as_ref(),
+    ) else {
+        return;
+    };
+
+    output.push(SubmoduleCommitRange {
+        path: path.clone(),
+        old_commit: old_commit.clone(),
+        new_commit: new_commit.clone(),
+    });
+}
+
+fn parse_diff_git_path(line: &str) -> Option<String> {
+    let (_, path) = line.rsplit_once(" b/")?;
+    Some(path.to_string())
+}
+
+#[cfg(test)]
 fn diff_lines<'a>(before: &'a str, after: &'a str) -> Vec<DiffLine<'a>> {
     diff_normalized_lines_by(before, after, |line| line)
 }
@@ -282,6 +444,7 @@ fn push_section_if_changed<'a>(
     }
 }
 
+#[cfg(test)]
 fn write_colored_diff(diff: &[DiffLine<'_>], writer: &mut impl Write) -> io::Result<()> {
     for line in diff {
         write_colored_line(line, writer)?;
@@ -290,6 +453,7 @@ fn write_colored_diff(diff: &[DiffLine<'_>], writer: &mut impl Write) -> io::Res
     Ok(())
 }
 
+#[cfg(test)]
 fn write_colored_diff_refs(diff: &[&DiffLine<'_>], writer: &mut impl Write) -> io::Result<()> {
     for line in diff {
         write_colored_line(line, writer)?;
@@ -333,11 +497,20 @@ fn write_equal_run_compact(run: &[&DiffLine<'_>], writer: &mut impl Write) -> io
         return Ok(());
     }
 
+    let header_index = run.iter().rposition(|line| is_file_section_start(line));
+    let tail_start = run.len() - UNCHANGED_CONTEXT_LINES;
+
     for line in &run[..UNCHANGED_CONTEXT_LINES] {
         write_colored_line(line, writer)?;
     }
 
-    for line in &run[run.len() - UNCHANGED_CONTEXT_LINES..] {
+    if let Some(header_index) = header_index {
+        if (UNCHANGED_CONTEXT_LINES..tail_start).contains(&header_index) {
+            write_colored_line(run[header_index], writer)?;
+        }
+    }
+
+    for line in &run[tail_start..] {
         write_colored_line(line, writer)?;
     }
 
@@ -492,6 +665,92 @@ mod tests {
             format!(
                 "  diff --git a/changed b/changed\n  line 1\n  line 2\n  line 6\n  line 7\n  line 8\n{RED}- -old{RESET}\n{GREEN}+ -new{RESET}\n"
             )
+        );
+    }
+
+    #[test]
+    fn keeps_file_header_when_compacting_across_file_sections() {
+        let diff = vec![
+            DiffLine::Equal("diff --git a/first b/first"),
+            DiffLine::Removed("-old first"),
+            DiffLine::Added("-new first"),
+            DiffLine::Equal("first tail 1"),
+            DiffLine::Equal("first tail 2"),
+            DiffLine::Equal("first tail 3"),
+            DiffLine::Equal("diff --git a/second b/second"),
+            DiffLine::Equal("second context 1"),
+            DiffLine::Equal("second context 2"),
+            DiffLine::Equal("second context 3"),
+            DiffLine::Equal("second context 4"),
+            DiffLine::Equal("second context 5"),
+            DiffLine::Removed("-old second"),
+            DiffLine::Added("-new second"),
+        ];
+        let changed = changed_file_sections(&diff);
+        let mut output = Vec::new();
+
+        write_compact_colored_diff_refs(&changed, &mut output).unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            format!(
+                "  diff --git a/first b/first\n{RED}- -old first{RESET}\n{GREEN}+ -new first{RESET}\n  first tail 1\n  first tail 2\n  first tail 3\n  diff --git a/second b/second\n  second context 3\n  second context 4\n  second context 5\n{RED}- -old second{RESET}\n{GREEN}+ -new second{RESET}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn parses_submodule_commit_ranges() {
+        let diff = "\
+diff --git a/libs/dep b/libs/dep
+index 1111111..2222222 160000
+--- a/libs/dep
++++ b/libs/dep
+@@ -1 +1 @@
+-Subproject commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
++Subproject commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+";
+
+        assert_eq!(
+            submodule_commit_ranges(diff),
+            vec![SubmoduleCommitRange {
+                path: "libs/dep".to_string(),
+                old_commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                new_commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn builds_submodule_patch_sets_from_before_and_after_diffs() {
+        let before = "\
+diff --git a/libs/dep b/libs/dep
+index 1111111..2222222 160000
+@@ -1 +1 @@
+-Subproject commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
++Subproject commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+";
+        let after = "\
+diff --git a/libs/dep b/libs/dep
+index 1111111..3333333 160000
+@@ -1 +1 @@
+-Subproject commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
++Subproject commit cccccccccccccccccccccccccccccccccccccccc
+";
+
+        assert_eq!(
+            submodule_patch_sets(before, after),
+            vec![SubmodulePatchSet {
+                path: "libs/dep".to_string(),
+                before_range: Some(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa..bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .to_string(),
+                ),
+                after_range: Some(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa..cccccccccccccccccccccccccccccccccccccccc"
+                        .to_string(),
+                ),
+            }]
         );
     }
 }
