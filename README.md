@@ -111,3 +111,6 @@ Submodule api
 
 ## AI Disclosure
 This repo was entirely vibe-coded by GPT-5.5 medium. No guarantees are made to its code quality.
+
+## License
+MIT License, Copyright (c) Vector 35 Inc, if GPT-generated code can even hold a copyright
